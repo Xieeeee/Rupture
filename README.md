@@ -1,6 +1,6 @@
 # Rupture
 
-A Python pipeline for processing droplet-based single-cell Hi-C data. Takes three-read FASTQ input (R1 DNA, R2 barcode, R3 DNA mate) and produces multi-resolution contact matrices in mcool format.
+A Python pipeline for processing [Droplet Hi-C](https://www.nature.com/articles/s41587-024-02447-1) data. Takes three-read FASTQ input (R1 DNA, R2 barcode, R3 DNA mate) and produces multi-resolution contact matrices in mcool format.
 
 ## Overview
 
@@ -18,7 +18,7 @@ Rupture wraps a 13-step Snakemake workflow into an installable Python package wi
 This installs both the external bioinformatics tools and the Python package:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/Rupture.git
+git clone https://github.com/Xieeeee/Rupture.git
 cd Rupture
 
 conda env create -f environment.yaml
@@ -227,6 +227,3 @@ Python libraries (installed via pip):
 - snakemake >=7.0
 - pyyaml >=6.0
 
-## License
-
-MIT
