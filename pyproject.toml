@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rupture"
+version = "0.1.0"
+description = "Single-cell Hi-C pipeline for droplet-based Hi-C data"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+authors = [
+    {name = "Yang Xie"},
+]
+dependencies = [
+    "pysam>=0.20",
+    "pandas>=1.4",
+    "numpy>=1.21",
+    "snakemake>=7.0",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+rupture = "rupture.cli.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"rupture.workflow" = ["Snakefile"]
+"rupture.data" = ["config_template.yaml"]

@@ -1,0 +1,23 @@
+### Rupture — Single-cell Hi-C Pipeline Config Template
+###
+### Usage:
+###   rupture init --dir /path/to/workdir   # creates this file as config.yaml
+###   rupture run --configfile config.yaml   # run the pipeline
+###
+### Copy this file to your working directory, edit the values, then run.
+
+# ── Required ──
+
+sample_id:
+  - sample1
+  # - sample2  # add more samples as needed
+
+bin_size: 5000       # base resolution for cooler (bp)
+genome: "hg38"       # genome assembly label (used in output filenames)
+
+# ── Required: reference paths ──
+# These must be set — there are no default paths.
+
+bc_ref: "/path/to/barcode/bowtie_index_prefix"   # bowtie v1 index prefix for barcode whitelist
+ref: "/path/to/genome.fa"                         # genome FASTA (must have bwa index)
+chrom_size: "/path/to/chrom.sizes"                # chromosome sizes file

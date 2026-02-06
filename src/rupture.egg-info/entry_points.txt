@@ -1,0 +1,2 @@
+[console_scripts]
+rupture = rupture.cli.main:main

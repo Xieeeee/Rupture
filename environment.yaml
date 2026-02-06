@@ -1,0 +1,30 @@
+name: rupture
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  # workflow manager
+  - snakemake>=7.0
+  # python
+  - python>=3.9
+  - numpy
+  - pandas
+  - pysam
+  - pyyaml
+  # aligners
+  - bowtie      # v1, for barcode alignment
+  - bwa         # genome alignment
+  # BAM/SAM utilities
+  - samtools
+  - htslib      # provides bgzip
+  # read trimming
+  - trim-galore # pulls in cutadapt automatically
+  # Hi-C specific
+  - pairtools
+  - pairix
+  - cooler
+  # install rupture itself
+  - pip
+  - pip:
+    - -e .
