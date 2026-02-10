@@ -83,6 +83,7 @@ rule stamp_hic:
             --out-r1 {output.R1_bc_fastq} \
             --out-r3 {output.R3_bc_fastq} \
             --bc-tag BC --min-mapq 40 \
+            --tmp-dir . \
             2>{output.stats}
         """
 

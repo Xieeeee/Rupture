@@ -32,6 +32,11 @@ def add_parser_stamp(subparsers):
         default=os.cpu_count(),
         help="BGZF threads for BAM reading.",
     )
+    p.add_argument(
+        "--tmp-dir",
+        default=None,
+        help="Directory for temporary sort files (default: system tmpdir).",
+    )
     p.set_defaults(func=stamp_cmd)
 
 
@@ -48,4 +53,5 @@ def stamp_cmd(args):
         min_mapq=args.min_mapq,
         threads=args.threads,
         sep=args.sep,
+        tmp_dir=args.tmp_dir,
     )

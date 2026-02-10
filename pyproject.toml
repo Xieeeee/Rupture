@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rupture"
-version = "0.1.0"
+version = "0.2.0"
 description = "Single-cell Hi-C pipeline for droplet-based Hi-C data"
 readme = "README.md"
 license = "MIT"

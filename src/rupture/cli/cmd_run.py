@@ -1,5 +1,6 @@
 """rupture run — invoke the bundled Snakefile via snakemake."""
 
+import argparse
 import subprocess
 import sys
 
@@ -17,7 +18,7 @@ def add_parser_run(subparsers):
     )
     p.add_argument(
         "--snakemake-args",
-        nargs="...",
+        nargs=argparse.REMAINDER,
         default=[],
         help="Additional arguments passed directly to snakemake.",
     )
