@@ -12,6 +12,9 @@
 ###   config.yaml
 
 import os
+import math
+import re as _re
+import glob as _glob
 
 # ── Configuration ──
 bin_size = int(config["bin_size"])
@@ -20,6 +23,21 @@ bin_size = int(config["bin_size"])
 bc_ref = config["bc_ref"]
 ref = config["ref"]
 chrom_size = config["chrom_size"]
+
+# ── Chunked processing ──
+chunk_size_gb = float(config.get("chunk_size", 0))
+
+def _get_chunk_ids(sample):
+    """Compute chunk IDs for a sample based on R1 FASTQ size."""
+    r1 = f"01.rawdata/{sample}_R1.fq.gz"
+    if chunk_size_gb <= 0 or not os.path.isfile(r1):
+        return ["part_001"]
+    size_gb = os.path.getsize(r1) / (1024 ** 3)
+    n = max(1, math.ceil(size_gb / chunk_size_gb))
+    return [f"part_{i:03d}" for i in range(1, n + 1)]
+
+# Pre-compute chunk IDs for all samples
+CHUNKS = {s: _get_chunk_ids(s) for s in config["sample_id"]}
 
 # ── Helper: runtime check for previous mapping BAMs ──
 def get_merge_inputs(wildcards):
@@ -30,13 +48,40 @@ def get_merge_inputs(wildcards):
         return [new_bam, old_bam]
     return [new_bam]
 
+# ── Helper: collect per-chunk outputs via checkpoint ──
+def _get_chunks_for_sample(wildcards):
+    """Resolve chunk IDs after the split_fastq checkpoint completes."""
+    chk = checkpoints.split_fastq.get(sample=wildcards.sample)
+    chunk_dir = chk.output[0]
+    chunks = glob_wildcards(
+        os.path.join(chunk_dir, f"{wildcards.sample}_R1.{{chunk}}.fq.gz")
+    ).chunk
+    return sorted(chunks)
+
+def get_chunk_bams(wildcards):
+    """Collect all per-chunk tagged BAMs for merging."""
+    chunks = _get_chunks_for_sample(wildcards)
+    return expand(
+        "03.mapping/chunks/{sample}/{sample}.{chunk}_{genome}.bam",
+        sample=wildcards.sample, chunk=chunks, genome=wildcards.genome,
+    )
+
+def get_chunk_qc_logs(wildcards):
+    """Collect all per-chunk QC logs for merging."""
+    chunks = _get_chunks_for_sample(wildcards)
+    return expand(
+        "00.qc/{sample}.{chunk}_qc.log",
+        sample=wildcards.sample, chunk=chunks,
+    )
+
 ###
 ### Rules
 ###
 
 wildcard_constraints:
     genome="[^._/]+",
-    sample="[^._/]+"
+    sample="[^._/]+",
+    chunk="part_\\d+"
 
 rule all:
     input:
@@ -47,16 +92,49 @@ rule all:
         expand("03.mapping/{sample}_{genome}.PairCount.stat.csv", sample=config["sample_id"], genome=config["genome"]),
         expand("03.mapping/{sample}_{genome}.sc.pairdedup.txt", sample=config["sample_id"], genome=config["genome"]),
         expand("03.mapping/{sample}_{genome}.bam", sample=config["sample_id"], genome=config["genome"]),
-        expand("00.qc/{sample}_qc.log", sample=config["sample_id"]),
-        expand("01.rawdata/{sample}_R1_BC_cov.fq.gz", sample=config["sample_id"]),
-        expand("01.rawdata/{sample}_R3_BC_cov.fq.gz", sample=config["sample_id"])
+        expand("00.qc/{sample}_qc.log", sample=config["sample_id"])
 
-### Step 1: align R2 (barcode reads) to barcode index
-rule align_bc:
+### ═══════════════════════════════════════════════════════════════════
+### Per-chunk processing (steps 0–5)
+### ═══════════════════════════════════════════════════════════════════
+
+### Step 0: split FASTQs into chunks
+checkpoint split_fastq:
     input:
-        R2_fastq="01.rawdata/{sample}_R2.fq.gz"
+        R1="01.rawdata/{sample}_R1.fq.gz",
+        R2="01.rawdata/{sample}_R2.fq.gz",
+        R3="01.rawdata/{sample}_R3.fq.gz"
     output:
-        R2_bam=temp("01.rawdata/{sample}_R2_BC.bam")
+        directory("01.rawdata/chunks/{sample}")
+    params:
+        n_chunks=lambda w: len(CHUNKS[w.sample])
+    threads: 4
+    run:
+        os.makedirs(output[0], exist_ok=True)
+        n = params.n_chunks
+        if n == 1:
+            # Single chunk: symlink instead of splitting
+            for read in ["R1", "R2", "R3"]:
+                src = os.path.realpath(f"01.rawdata/{wildcards.sample}_{read}.fq.gz")
+                dst = os.path.join(output[0], f"{wildcards.sample}_{read}.part_001.fq.gz")
+                os.symlink(src, dst)
+        else:
+            for read in ["R1", "R2", "R3"]:
+                fq = f"01.rawdata/{wildcards.sample}_{read}.fq.gz"
+                shell(f"seqkit split2 -p {n} -j {{threads}} -O {{output[0]}} -1 {fq}")
+            # Rename seqkit output: *.fq.part_NNN.gz -> *.part_NNN.fq.gz
+            for f in _glob.glob(os.path.join(output[0], "*.fq.part_*.gz")):
+                base = os.path.basename(f)
+                new_name = _re.sub(r'\.fq\.part_(\d+)\.gz$', r'.part_\1.fq.gz', base)
+                if new_name != base:
+                    os.rename(f, os.path.join(output[0], new_name))
+
+### Step 1: align R2 (barcode reads) to barcode index — per chunk
+rule align_bc_chunk:
+    input:
+        R2_fastq="01.rawdata/chunks/{sample}/{sample}_R2.{chunk}.fq.gz"
+    output:
+        R2_bam=temp("01.rawdata/chunks/{sample}/{sample}_R2.{chunk}_BC.bam")
     threads: 16
     shell:
         """
@@ -64,16 +142,16 @@ rule align_bc:
             samtools view -b -F 4 -@ {threads} -o {output.R2_bam} -
         """
 
-### Step 2: stamp barcodes onto R1/R3 read headers
-rule stamp_hic:
+### Step 2: stamp barcodes onto R1/R3 read headers — per chunk
+rule stamp_hic_chunk:
     input:
-        R1_fastq="01.rawdata/{sample}_R1.fq.gz",
-        R3_fastq="01.rawdata/{sample}_R3.fq.gz",
-        R2_bam="01.rawdata/{sample}_R2_BC.bam"
+        R1_fastq="01.rawdata/chunks/{sample}/{sample}_R1.{chunk}.fq.gz",
+        R3_fastq="01.rawdata/chunks/{sample}/{sample}_R3.{chunk}.fq.gz",
+        R2_bam="01.rawdata/chunks/{sample}/{sample}_R2.{chunk}_BC.bam"
     output:
-        R1_bc_fastq="01.rawdata/{sample}_R1_BC_cov.fq.gz",
-        R3_bc_fastq="01.rawdata/{sample}_R3_BC_cov.fq.gz",
-        stats="00.qc/{sample}_qc.log"
+        R1_bc_fastq=temp("01.rawdata/chunks/{sample}/{sample}_R1.{chunk}_BC_cov.fq.gz"),
+        R3_bc_fastq=temp("01.rawdata/chunks/{sample}/{sample}_R3.{chunk}_BC_cov.fq.gz"),
+        stats="00.qc/{sample}.{chunk}_qc.log"
     shell:
         """
         rupture stamp \
@@ -87,42 +165,72 @@ rule stamp_hic:
             2>{output.stats}
         """
 
-### Step 3: quality trimming
-rule trim_dna:
+### Step 3: quality trimming — per chunk
+rule trim_dna_chunk:
     input:
-        R1_cov="01.rawdata/{sample}_R1_BC_cov.fq.gz",
-        R3_cov="01.rawdata/{sample}_R3_BC_cov.fq.gz"
+        R1_cov="01.rawdata/chunks/{sample}/{sample}_R1.{chunk}_BC_cov.fq.gz",
+        R3_cov="01.rawdata/chunks/{sample}/{sample}_R3.{chunk}_BC_cov.fq.gz"
     output:
-        R1_trimmed=temp("02.trimmed/{sample}_R1_BC_cov_val_1.fq.gz"),
-        R3_trimmed=temp("02.trimmed/{sample}_R3_BC_cov_val_2.fq.gz"),
-        R1_stats=temp("02.trimmed/{sample}_R1_BC_cov.fq.gz_trimming_report.txt"),
-        R3_stats=temp("02.trimmed/{sample}_R3_BC_cov.fq.gz_trimming_report.txt")
+        R1_trimmed=temp("02.trimmed/chunks/{sample}/{sample}_R1.{chunk}_BC_cov_val_1.fq.gz"),
+        R3_trimmed=temp("02.trimmed/chunks/{sample}/{sample}_R3.{chunk}_BC_cov_val_2.fq.gz"),
+        R1_stats=temp("02.trimmed/chunks/{sample}/{sample}_R1.{chunk}_BC_cov.fq.gz_trimming_report.txt"),
+        R3_stats=temp("02.trimmed/chunks/{sample}/{sample}_R3.{chunk}_BC_cov.fq.gz_trimming_report.txt")
     threads: 16
     shell:
-        "trim_galore --cores {threads} -q 20 --paired {input.R1_cov} {input.R3_cov} -o 02.trimmed/"
+        "trim_galore --cores {threads} -q 20 --paired {input.R1_cov} {input.R3_cov} -o 02.trimmed/chunks/{wildcards.sample}/"
 
-### Step 4: align to reference genome
-rule bwa:
+### Step 4: align to reference genome — per chunk
+rule bwa_chunk:
     input:
-        R1_trimmed="02.trimmed/{sample}_R1_BC_cov_val_1.fq.gz",
-        R3_trimmed="02.trimmed/{sample}_R3_BC_cov_val_2.fq.gz"
+        R1_trimmed="02.trimmed/chunks/{sample}/{sample}_R1.{chunk}_BC_cov_val_1.fq.gz",
+        R3_trimmed="02.trimmed/chunks/{sample}/{sample}_R3.{chunk}_BC_cov_val_2.fq.gz"
     output:
-        bam=temp("03.mapping/{sample}_{genome}.raw.bam"),
-        stats=temp("03.mapping/{sample}_{genome}.bwa.log")
+        bam=temp("03.mapping/chunks/{sample}/{sample}.{chunk}_{genome}.raw.bam"),
+        stats=temp("03.mapping/chunks/{sample}/{sample}.{chunk}_{genome}.bwa.log")
     threads: 16
     shell:
         "(bwa mem -SP5M -T0 -t{threads} {ref} {input.R1_trimmed} {input.R3_trimmed} | samtools view -bhS - > {output.bam}) 2>{output.stats}"
 
-### Step 5: extract barcode from read name into CB BAM tag
-rule add_field:
+### Step 5: extract barcode from read name into CB BAM tag — per chunk
+rule add_field_chunk:
     input:
-        "03.mapping/{sample}_{genome}.raw.bam"
+        "03.mapping/chunks/{sample}/{sample}.{chunk}_{genome}.raw.bam"
     output:
-        "03.mapping/{sample}_{genome}.bam"
+        temp("03.mapping/chunks/{sample}/{sample}.{chunk}_{genome}.bam")
     shell:
         """
         rupture add-tag --input {input} --output {output} --field -1 --tag CB --sep ":"
         """
+
+### ═══════════════════════════════════════════════════════════════════
+### Merge stage
+### ═══════════════════════════════════════════════════════════════════
+
+### Step 5b: merge chunk BAMs into one sample BAM
+rule merge_chunk_bams:
+    input:
+        get_chunk_bams
+    output:
+        "03.mapping/{sample}_{genome}.bam"
+    threads: 16
+    run:
+        if len(input) == 1:
+            shell("ln -sf $(realpath {input[0]}) {output[0]}")
+        else:
+            shell("samtools merge -@ {threads} {output} {input}")
+
+### Merge per-chunk QC logs into one sample QC log
+rule merge_qc_logs:
+    input:
+        get_chunk_qc_logs
+    output:
+        "00.qc/{sample}_qc.log"
+    shell:
+        "cat {input} > {output}"
+
+### ═══════════════════════════════════════════════════════════════════
+### Single-stream processing (steps 6–13, unchanged)
+### ═══════════════════════════════════════════════════════════════════
 
 ### Step 6: merge with previous mapping if available, otherwise just link
 rule prepare_work_bam:

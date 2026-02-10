@@ -21,3 +21,6 @@ genome: "hg38"       # genome assembly label (used in output filenames)
 bc_ref: "/path/to/barcode/bowtie_index_prefix"   # bowtie v1 index prefix for barcode whitelist
 ref: "/path/to/genome.fa"                         # genome FASTA (must have bwa index)
 chrom_size: "/path/to/chrom.sizes"                # chromosome sizes file
+
+# ── Optional: chunked processing for large FASTQs ──
+chunk_size: 0            # max FASTQ size in GB per chunk (0 = no splitting)

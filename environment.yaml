@@ -18,6 +18,7 @@ dependencies:
   # BAM/SAM utilities
   - samtools
   - htslib      # provides bgzip
+  - seqkit      # FASTQ splitting for chunked processing
   # read trimming
   - trim-galore # pulls in cutadapt automatically
   # Hi-C specific
