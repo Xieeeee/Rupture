@@ -39,14 +39,20 @@ def _get_chunk_ids(sample):
 # Pre-compute chunk IDs for all samples
 CHUNKS = {s: _get_chunk_ids(s) for s in config["sample_id"]}
 
-# ── Helper: runtime check for previous mapping BAMs ──
-def get_merge_inputs(wildcards):
-    """If a previous BAM exists in 07.prev_mapping/, include it for merging."""
-    new_bam = f"03.mapping/{wildcards.sample}_{wildcards.genome}.bam"
-    old_bam = f"07.prev_mapping/{wildcards.sample}_{wildcards.genome}.bam"
-    if os.path.isfile(old_bam):
-        return [new_bam, old_bam]
-    return [new_bam]
+# Parse main chromosomes from chrom_size for per-chromosome dedup
+def _get_chroms():
+    """Read chromosome names from chrom_size file."""
+    chroms = []
+    with open(chrom_size) as f:
+        for line in f:
+            parts = line.strip().split()
+            if parts:
+                chroms.append(parts[0])
+    return chroms
+
+CHROMS = _get_chroms()
+# All split targets: main chromosomes + catch-all for unmapped/non-standard
+CHROM_TARGETS = CHROMS + ["other"]
 
 # ── Helper: collect per-chunk outputs via checkpoint ──
 def _get_chunks_for_sample(wildcards):
@@ -56,6 +62,7 @@ def _get_chunks_for_sample(wildcards):
     chunks = glob_wildcards(
         os.path.join(chunk_dir, f"{wildcards.sample}_R1.{{chunk}}.fq.gz")
     ).chunk
+    chunks = [c for c in chunks if _re.fullmatch(r"part_\d+", c)]
     return sorted(chunks)
 
 def get_chunk_bams(wildcards):
@@ -74,6 +81,24 @@ def get_chunk_qc_logs(wildcards):
         sample=wildcards.sample, chunk=chunks,
     )
 
+def get_chunk_sorted_pairsams(wildcards):
+    """Collect all per-chunk sorted pairsams for merging."""
+    chunks = _get_chunks_for_sample(wildcards)
+    return expand(
+        "03.mapping/chunks/{sample}/{sample}.{chunk}_{genome}_sorted.pairsam.gz",
+        sample=wildcards.sample, chunk=chunks, genome=wildcards.genome,
+    )
+
+def get_all_sorted_pairsams_for_merge(wildcards):
+    """Collect chunk pairsams + optional prev_mapping pairsam."""
+    pairsams = get_chunk_sorted_pairsams(wildcards)
+    prev_bam = f"07.prev_mapping/{wildcards.sample}_{wildcards.genome}.bam"
+    if os.path.isfile(prev_bam):
+        pairsams = list(pairsams) + [
+            f"03.mapping/{wildcards.sample}_{wildcards.genome}.prev_sorted.pairsam.gz"
+        ]
+    return pairsams
+
 ###
 ### Rules
 ###
@@ -81,7 +106,8 @@ def get_chunk_qc_logs(wildcards):
 wildcard_constraints:
     genome="[^._/]+",
     sample="[^._/]+",
-    chunk="part_\\d+"
+    chunk="part_\\d+",
+    chrom="[^._/]+"
 
 rule all:
     input:
@@ -202,6 +228,52 @@ rule add_field_chunk:
         rupture add-tag --input {input} --output {output} --field -1 --tag CB --sep ":"
         """
 
+### Step 5c: parse + sort per chunk — streams BAM → sorted compressed pairsam
+rule pairtools_parse_sort_chunk:
+    input:
+        bam="03.mapping/chunks/{sample}/{sample}.{chunk}_{genome}.bam"
+    output:
+        sorted_pairsam=temp("03.mapping/chunks/{sample}/{sample}.{chunk}_{genome}_sorted.pairsam.gz"),
+        stats="03.mapping/chunks/{sample}/{sample}.{chunk}_{genome}.pairparse.txt"
+    threads: 16
+    shell:
+        '''
+        samtools view -h {input.bam} | \
+        pairtools parse --min-mapq 30 --walks-policy all \
+            --nproc-in {threads} --nproc-out {threads} \
+            --max-inter-align-gap 30 \
+            --chroms-path {chrom_size} \
+            --assembly {wildcards.genome} \
+            --output-stats {output.stats} \
+            --add-columns CB | \
+        pairtools sort --nproc {threads} --memory 16G \
+            --tmpdir 03.mapping/chunks/{wildcards.sample} \
+            --compress-program bgzip \
+            -o {output.sorted_pairsam}
+        '''
+
+### Optional: parse + sort a previous-mapping BAM from 07.prev_mapping/
+rule pairtools_parse_sort_prev:
+    input:
+        bam="07.prev_mapping/{sample}_{genome}.bam"
+    output:
+        temp("03.mapping/{sample}_{genome}.prev_sorted.pairsam.gz")
+    threads: 16
+    shell:
+        '''
+        samtools view -h {input.bam} | \
+        pairtools parse --min-mapq 30 --walks-policy all \
+            --nproc-in {threads} --nproc-out {threads} \
+            --max-inter-align-gap 30 \
+            --chroms-path {chrom_size} \
+            --assembly {wildcards.genome} \
+            --add-columns CB | \
+        pairtools sort --nproc {threads} --memory 16G \
+            --tmpdir 03.mapping \
+            --compress-program bgzip \
+            -o {output}
+        '''
+
 ### ═══════════════════════════════════════════════════════════════════
 ### Merge stage
 ### ═══════════════════════════════════════════════════════════════════
@@ -228,71 +300,160 @@ rule merge_qc_logs:
     shell:
         "cat {input} > {output}"
 
-### ═══════════════════════════════════════════════════════════════════
-### Single-stream processing (steps 6–13, unchanged)
-### ═══════════════════════════════════════════════════════════════════
-
-### Step 6: merge with previous mapping if available, otherwise just link
-rule prepare_work_bam:
+### Merge sorted per-chunk pairsams into one sorted pairsam
+rule pairtools_merge_sorted_chunks:
     input:
-        get_merge_inputs
+        get_all_sorted_pairsams_for_merge
     output:
-        temp("03.mapping/{sample}_work_{genome}.bam")
+        temp("03.mapping/{sample}_{genome}_sorted.pairsam.gz")
     threads: 16
     run:
-        if len(input) > 1:
-            shell("samtools merge -@ {threads} {output} {input}")
-        else:
+        if len(input) == 1:
             shell("ln -sf $(realpath {input[0]}) {output[0]}")
+        else:
+            shell(
+                "pairtools merge --nproc-in {threads} --nproc-out {threads} "
+                "--memory 16G --tmpdir 03.mapping "
+                "--compress-program bgzip "
+                "-o {output} {input}"
+            )
 
-### Step 7: parse BAM to pairs format
-rule pairtools_parse:
-    input:
-        "03.mapping/{sample}_work_{genome}.bam"
-    output:
-        pairsam=temp("03.mapping/{sample}_{genome}.pairsam"),
-        stats="03.mapping/{sample}_{genome}.pairparse.txt"
-    threads: 16
-    shell:
-        '''
-        samtools view -h {input} | \
-        pairtools parse --min-mapq 30 --walks-policy all \
-            --nproc-in {threads} --nproc-out {threads} \
-            --max-inter-align-gap 30 \
-            --chroms-path {chrom_size} \
-            --assembly {wildcards.genome} \
-            --output-stats {output.stats} \
-            --add-columns CB \
-            -o {output.pairsam}
-        '''
+### ═══════════════════════════════════════════════════════════════════
+### Per-chromosome parallel dedup + downstream (steps 9–13)
+### ═══════════════════════════════════════════════════════════════════
 
-### Step 8: sort pairs
-rule pairtools_sort:
+### Step 9a: split sorted pairsam by chrom1 for parallel dedup
+rule split_pairsam_by_chrom:
     input:
-        "03.mapping/{sample}_{genome}.pairsam"
+        "03.mapping/{sample}_{genome}_sorted.pairsam.gz"
     output:
-        temp("03.mapping/{sample}_{genome}_sorted.pairsam")
-    threads: 16
-    shell:
-        "pairtools sort --nproc {threads} --memory 16G --tmpdir=03.mapping -o {output} {input}"
+        temp(expand(
+            "03.mapping/by_chrom/{{sample}}_{{genome}}/{chrom}_sorted.pairsam.gz",
+            chrom=CHROM_TARGETS
+        ))
+    threads: 4
+    run:
+        import subprocess
+        outdir = f"03.mapping/by_chrom/{wildcards.sample}_{wildcards.genome}"
+        os.makedirs(outdir, exist_ok=True)
 
-### Step 9: deduplicate
-rule pairtools_dedup:
+        chrom_set = set(CHROMS)
+
+        # Open a bgzip writer subprocess for each target
+        writers = {}
+        out_fhs = {}
+        for name in CHROM_TARGETS:
+            path = os.path.join(outdir, f"{name}_sorted.pairsam.gz")
+            fh = open(path, "wb")
+            proc = subprocess.Popen(["bgzip", "-c"], stdin=subprocess.PIPE, stdout=fh)
+            writers[name] = proc
+            out_fhs[name] = fh
+
+        # Decompress the merged sorted pairsam in a streaming fashion
+        dec = subprocess.Popen(
+            ["bgzip", "-dc", "-@", str(threads)],
+            stdin=open(str(input[0]), "rb"),
+            stdout=subprocess.PIPE,
+            bufsize=4 * 1024 * 1024,
+        )
+
+        header_lines = []
+        header_done = False
+
+        for line in dec.stdout:
+            if line.startswith(b"#"):
+                header_lines.append(line)
+                continue
+
+            if not header_done:
+                # Write the full header to every per-chrom file
+                for w in writers.values():
+                    for h in header_lines:
+                        w.stdin.write(h)
+                header_done = True
+
+            # Extract chrom1 (2nd column, tab-separated)
+            i = line.index(b"\t")
+            j = line.index(b"\t", i + 1)
+            chrom1 = line[i + 1 : j].decode()
+            target = chrom1 if chrom1 in chrom_set else "other"
+            writers[target].stdin.write(line)
+
+        for name in CHROM_TARGETS:
+            writers[name].stdin.close()
+            writers[name].wait()
+            out_fhs[name].close()
+        dec.wait()
+
+### Step 9b: deduplicate per chromosome (runs in parallel across chroms)
+rule pairtools_dedup_chrom:
     input:
-        "03.mapping/{sample}_{genome}_sorted.pairsam"
+        "03.mapping/by_chrom/{sample}_{genome}/{chrom}_sorted.pairsam.gz"
     output:
-        dedup_pairsam=temp("03.mapping/{sample}_{genome}_dedup.pairsam"),
-        stats="03.mapping/{sample}_{genome}.sc.pairdedup.txt"
-    threads: 16
+        dedup=temp("03.mapping/by_chrom/{sample}_{genome}/{chrom}_dedup.pairsam"),
+        stats=temp("03.mapping/by_chrom/{sample}_{genome}/{chrom}_dedup_stats.txt")
+    threads: 2
     shell:
         '''
         pairtools dedup --nproc-in {threads} --nproc-out {threads} \
             --extra-col-pair "CB1" "CB2" \
             --mark-dups \
-            -o {output.dedup_pairsam} \
+            -o {output.dedup} \
             --output-stats {output.stats} \
             {input}
         '''
+
+### Step 9c: concatenate per-chromosome deduped pairsams
+rule concat_dedup_pairsams:
+    input:
+        expand(
+            "03.mapping/by_chrom/{{sample}}_{{genome}}/{chrom}_dedup.pairsam",
+            chrom=CHROM_TARGETS
+        )
+    output:
+        temp("03.mapping/{sample}_{genome}_dedup.pairsam")
+    run:
+        header_written = False
+        with open(str(output[0]), "wb") as out:
+            for f in input:
+                with open(str(f), "rb") as fh:
+                    for line in fh:
+                        if line.startswith(b"#"):
+                            if not header_written:
+                                out.write(line)
+                        else:
+                            if not header_written:
+                                header_written = True
+                            out.write(line)
+
+### Step 9d: merge per-chromosome dedup statistics
+rule merge_dedup_stats:
+    input:
+        expand(
+            "03.mapping/by_chrom/{{sample}}_{{genome}}/{chrom}_dedup_stats.txt",
+            chrom=CHROM_TARGETS
+        )
+    output:
+        "03.mapping/{sample}_{genome}.sc.pairdedup.txt"
+    run:
+        from collections import OrderedDict
+        merged = OrderedDict()
+        for stats_file in input:
+            with open(str(stats_file)) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = line.split("\t", 1)
+                    if len(parts) == 2:
+                        try:
+                            val = int(parts[1])
+                            merged[parts[0]] = merged.get(parts[0], 0) + val
+                        except ValueError:
+                            pass  # skip floats; summarize_qc recomputes from counts
+        with open(str(output[0]), "w") as fh:
+            for key, val in merged.items():
+                fh.write(f"{key}\t{val}\n")
 
 ### Step 10: split deduped pairsam into pairs + BAM
 rule pairtools_split:
@@ -334,9 +495,10 @@ rule bgzip:
     output:
         pairs="03.mapping/{sample}_{genome}.sc.pairs.gz",
         index="03.mapping/{sample}_{genome}.sc.pairs.gz.px2"
+    threads: 8
     shell:
         '''
-        bgzip -c {input} > {output.pairs}
+        pairtools sort --nproc {threads} {input} | bgzip -c > {output.pairs}
         pairix -f {output.pairs}
         '''
 
