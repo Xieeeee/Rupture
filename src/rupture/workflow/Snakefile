@@ -287,7 +287,8 @@ rule merge_chunk_bams:
     threads: 16
     run:
         if len(input) == 1:
-            shell("ln -sf $(realpath {input[0]}) {output[0]}")
+            # Hard link (not symlink): survives Snakemake reaping the temp() input
+            shell("ln -f {input[0]} {output[0]}")
         else:
             shell("samtools merge -@ {threads} {output} {input}")
 
@@ -301,19 +302,27 @@ rule merge_qc_logs:
         "cat {input} > {output}"
 
 ### Merge sorted per-chunk pairsams into one sorted pairsam
+###
+### NB: pairtools merge spawns nproc-in decompression threads PER input file
+### (so 16 × 30 inputs ≈ 480 threads), which thrashes the OS and stalls
+### output. Keep --nproc-in low and bump --max-nmerge above #inputs so the
+### merge completes in a single pass without intermediate temp files.
 rule pairtools_merge_sorted_chunks:
     input:
         get_all_sorted_pairsams_for_merge
     output:
         temp("03.mapping/{sample}_{genome}_sorted.pairsam.gz")
-    threads: 16
+    threads: 8
     run:
         if len(input) == 1:
-            shell("ln -sf $(realpath {input[0]}) {output[0]}")
+            # Hard link (not symlink): survives Snakemake reaping the temp() input
+            shell("ln -f {input[0]} {output[0]}")
         else:
+            max_nmerge = max(8, len(input) + 1)
             shell(
-                "pairtools merge --nproc-in {threads} --nproc-out {threads} "
-                "--memory 16G --tmpdir 03.mapping "
+                "pairtools merge --nproc-in 1 --nproc-out {threads} "
+                f"--max-nmerge {max_nmerge} "
+                "--tmpdir 03.mapping "
                 "--compress-program bgzip "
                 "-o {output} {input}"
             )
