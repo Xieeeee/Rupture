@@ -402,10 +402,16 @@ rule pairtools_dedup_chrom:
         dedup=temp("03.mapping/by_chrom/{sample}_{genome}/{chrom}_dedup.pairsam"),
         stats=temp("03.mapping/by_chrom/{sample}_{genome}/{chrom}_dedup_stats.txt")
     threads: 2
+    # Barcode columns are matched as CB1/CB1 and CB2/CB2, never CB1/CB2.
+    # pairtools >=1.1 routes non-matching column names to
+    # _cluster_pairs_nonmatching_col_pairs, whose cluster ids lack a "+1"
+    # offset: one unique pair per (chrom1, chrom2, strand1, strand2, CB)
+    # group per chunk is wrongly marked as a duplicate.
     shell:
         '''
         pairtools dedup --nproc-in {threads} --nproc-out {threads} \
-            --extra-col-pair "CB1" "CB2" \
+            --extra-col-pair "CB1" "CB1" \
+            --extra-col-pair "CB2" "CB2" \
             --mark-dups \
             -o {output.dedup} \
             --output-stats {output.stats} \
